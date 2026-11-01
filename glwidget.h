@@ -11,10 +11,15 @@
 #include <QPoint>
 #include <QTimer>
 #include <QWheelEvent>
+#include <chrono>
+#include <functional>
+#include <string>
 
 #include <vector>
 
 #include "particlesystem.h"
+#include "benchmark.h"
+
 
 class GLWidget : public QOpenGLWidget,
                  protected QOpenGLFunctions
@@ -34,6 +39,16 @@ public:
     void resetCover();
 
     float fps() const;
+    void setCollisionAlgorithm(CollisionAlgorithm algorithm);
+    void setObjectCount(int count);
+    void startBenchmark();
+    void stopBenchmark();
+    bool benchmarkRunning() const;
+    int benchmarkIndex() const;
+    int benchmarkTotal() const;
+    // completed = false, если остановили вручную
+    std::function<void(bool completed, const std::string& csv)> onBenchmarkFinished;
+
 
 protected:
     void initializeGL() override;
@@ -109,6 +124,23 @@ private:
     float m_pitch;
     float m_distance;
     QPoint m_lastMousePos;
+
+    void benchmarkStep();
+    void applyBenchmarkConfig();
+    void finishBenchmark();
+    void restoreAfterBenchmark(bool completed, const std::string& csv = std::string());
+
+    Benchmark m_benchmark;
+    bool m_benchApply = false;
+    bool m_benchPainted = true;
+    double m_benchUpdateMs = 0.0;
+    std::chrono::steady_clock::time_point m_benchLastFrame;
+
+    int m_objectCount = 0;
+    std::size_t m_savedIntensity = 5000;
+    CollisionAlgorithm m_savedAlgorithm = CollisionAlgorithm::BruteForce;
+    int m_savedObjects = 0;
+    float m_savedYaw = 25.0f, m_savedPitch = 20.0f, m_savedDistance = 26.0f;
 };
 
 #endif // GLWIDGET_H

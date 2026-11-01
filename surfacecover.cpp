@@ -5,6 +5,8 @@
 SurfaceCover::SurfaceCover()
     : m_snow(kSize * kSize, 0.0f)
     , m_wet(kSize * kSize, 0.0f)
+    , m_material(kSize * kSize, static_cast<unsigned char>(Material::Grass))
+    , m_dryScale(kSize * kSize, materialProps(Material::Grass).dryRate)
     , m_pixels(kSize * kSize * 4, 0)
 {
     clear();
@@ -16,6 +18,23 @@ void SurfaceCover::clear()
     std::fill(m_wet.begin(), m_wet.end(), 0.0f);
 
     rebuildPixels();
+}
+
+void SurfaceCover::setMaterialMap(const std::vector<unsigned char>& map)
+{
+    if (map.size() != m_material.size())
+        return;
+
+    m_material = map;
+
+    for (std::size_t i = 0; i < m_material.size(); ++i)
+    {
+        const int id = std::min<int>(m_material[i], kMaterialCount - 1);
+        m_material[i] = static_cast<unsigned char>(id);
+        m_dryScale[i] = materialProps(static_cast<Material>(id)).dryRate;
+    }
+
+    clear();
 }
 
 int SurfaceCover::cellIndex(float x, float z) const
@@ -32,15 +51,27 @@ int SurfaceCover::cellIndex(float x, float z) const
     return iz * kSize + ix;
 }
 
+Material SurfaceCover::materialAt(float x, float z) const
+{
+    const int i = cellIndex(x, z);
+    if (i < 0)
+        return Material::Grass;
+
+    return static_cast<Material>(m_material[i]);
+}
+
 void SurfaceCover::addSnow(float x, float z, float amount)
 {
     const int i = cellIndex(x, z);
-
     if (i < 0)
         return;
 
-    // На мокрой поверхности снег накапливается хуже (тает).
-    const float efficiency = 1.0f - 0.8f * m_wet[i];
+    const MaterialProps& props =
+        materialProps(static_cast<Material>(m_material[i]));
+
+    // На мокрой поверхности снег накапливается хуже (тает),
+    // а материал определяет, сколько снега вообще удерживается.
+    const float efficiency = (1.0f - 0.8f * m_wet[i]) * props.snowGain;
 
     m_snow[i] = std::min(1.0f, m_snow[i] + amount * efficiency);
 }
@@ -48,21 +79,24 @@ void SurfaceCover::addSnow(float x, float z, float amount)
 void SurfaceCover::addRain(float x, float z)
 {
     const int i = cellIndex(x, z);
-
     if (i < 0)
         return;
 
-    m_wet[i] = std::min(1.0f, m_wet[i] + 0.08f);
-    m_snow[i] = std::max(0.0f, m_snow[i] - 0.02f);
+    const MaterialProps& props =
+        materialProps(static_cast<Material>(m_material[i]));
+
+    m_wet[i] = std::min(1.0f, m_wet[i] + 0.08f * props.wetGain);
+    m_snow[i] = std::max(0.0f, m_snow[i] - 0.02f * props.meltRate);
 }
 
 void SurfaceCover::update(float deltaTime, bool snowing)
 {
     // Поверхность высыхает; в мороз/снегопад быстрее.
+    // Скорость зависит от материала: пористые (дерево) сохнут дольше.
     const float dryRate = snowing ? 0.04f : 0.01f;
 
-    for (float& w : m_wet)
-        w = std::max(0.0f, w - dryRate * deltaTime);
+    for (std::size_t i = 0; i < m_wet.size(); ++i)
+        m_wet[i] = std::max(0.0f, m_wet[i] - dryRate * m_dryScale[i] * deltaTime);
 
     rebuildPixels();
 }

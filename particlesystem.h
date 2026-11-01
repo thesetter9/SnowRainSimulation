@@ -3,11 +3,13 @@
 
 #include <vector>
 #include <cstddef>
+#include <memory>
 
 #include <glm/glm.hpp>
 
 #include "particle.h"
 #include "surfacecover.h"
+#include "collision.h"
 
 class ParticleSystem
 {
@@ -35,6 +37,10 @@ public:
     // Покрытие поверхностей: снег и влажность.
     const SurfaceCover& cover() const;
     void resetCover();
+    void setCollisionAlgorithm(CollisionAlgorithm algorithm);
+    CollisionAlgorithm collisionAlgorithm() const;
+    void setObjectCount(int count);          // 0 = базовая сцена
+    const BoxList& boxes() const;
 
 private:
     void resetParticle(Particle& particle);
@@ -60,6 +66,9 @@ private:
     std::size_t m_splashCursor;
 
     float m_time;
+    BoxList m_boxes;
+    std::unique_ptr<ICollision> m_collision;
+    CollisionAlgorithm m_algorithm = CollisionAlgorithm::BruteForce;
 };
 
 #endif // PARTICLESYSTEM_H

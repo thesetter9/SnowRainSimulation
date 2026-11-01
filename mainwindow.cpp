@@ -1,8 +1,11 @@
 #include "mainwindow.h"
 #include "glwidget.h"
+#include "collision.h"
 
 #include <QComboBox>
 #include <QDockWidget>
+#include <QFile>
+#include <QFileDialog>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMainWindow>
@@ -145,6 +148,58 @@ void MainWindow::createInterface()
         m_windLabel
         );
 
+    // Алгоритм обнаружения столкновений.
+    controlsLayout->addWidget(
+        new QLabel("Коллизии:")
+        );
+
+    QComboBox* collisionCombo =
+        new QComboBox();
+
+    const CollisionAlgorithm algorithms[] =
+        {
+            CollisionAlgorithm::BruteForce,
+            CollisionAlgorithm::HeightMap,
+            CollisionAlgorithm::UniformGrid
+        };
+
+    for (CollisionAlgorithm algorithm : algorithms)
+    {
+        collisionCombo->addItem(
+            QString::fromUtf8(collisionName(algorithm)),
+            static_cast<int>(algorithm)
+            );
+    }
+
+    collisionCombo->setToolTip(
+        "Алгоритм поиска поверхности под частицей"
+        );
+
+    controlsLayout->addWidget(
+        collisionCombo
+        );
+
+    // Число объектов на сцене.
+    controlsLayout->addWidget(
+        new QLabel("Объектов:")
+        );
+
+    QComboBox* objectsCombo =
+        new QComboBox();
+
+    objectsCombo->addItem("5 (базовая)", 0);
+
+    for (int n : {50, 200, 1000, 3000})
+        objectsCombo->addItem(QString::number(n), n);
+
+    objectsCombo->setToolTip(
+        "Число статических объектов (для исследования коллизий)"
+        );
+
+    controlsLayout->addWidget(
+        objectsCombo
+        );
+
     m_fpsLabel =
         new QLabel("FPS: --");
 
@@ -218,6 +273,38 @@ void MainWindow::createInterface()
         }
         );
 
+    // Алгоритм коллизий.
+    connect(
+        collisionCombo,
+        QOverload<int>::of(
+            &QComboBox::currentIndexChanged
+            ),
+        this,
+        [this, collisionCombo](int)
+        {
+            m_glWidget->setCollisionAlgorithm(
+                static_cast<CollisionAlgorithm>(
+                    collisionCombo->currentData().toInt()
+                    )
+                );
+        }
+        );
+
+    // Число объектов на сцене.
+    connect(
+        objectsCombo,
+        QOverload<int>::of(
+            &QComboBox::currentIndexChanged
+            ),
+        this,
+        [this, objectsCombo](int)
+        {
+            m_glWidget->setObjectCount(
+                objectsCombo->currentData().toInt()
+                );
+        }
+        );
+
     // Обновляем FPS примерно раз в 500 мс.
     QTimer* fpsTimer =
         new QTimer(this);
@@ -228,6 +315,16 @@ void MainWindow::createInterface()
         this,
         [this]()
         {
+            if (m_glWidget->benchmarkRunning())
+            {
+                m_fpsLabel->setText(
+                    QString("Бенчмарк: %1/%2")
+                        .arg(m_glWidget->benchmarkIndex() + 1)
+                        .arg(m_glWidget->benchmarkTotal())
+                    );
+                return;
+            }
+
             m_fpsLabel->setText(
                 QString("FPS: %1")
                     .arg(
@@ -259,6 +356,102 @@ void MainWindow::createMenus()
         this,
         &QMainWindow::close
         );
+
+    QMenu* researchMenu =
+        menuBar()->addMenu("Исследование");
+
+    QAction* startBenchAction =
+        researchMenu->addAction(
+            "Запустить бенчмарк"
+            );
+
+    QAction* stopBenchAction =
+        researchMenu->addAction(
+            "Остановить бенчмарк"
+            );
+
+    stopBenchAction->setEnabled(false);
+
+    connect(
+        startBenchAction,
+        &QAction::triggered,
+        this,
+        [this, startBenchAction, stopBenchAction]()
+        {
+            const auto answer = QMessageBox::question(
+                this,
+                "Бенчмарк",
+                "Будут измерены время физики, отрисовки и FPS для "
+                "разных алгоритмов коллизий, числа частиц и объектов "
+                "(60 конфигураций, несколько минут).\n\n"
+                "Замеры идут для выбранного сейчас типа осадков. "
+                "Управление на это время блокируется. Начать?"
+                );
+
+            if (answer != QMessageBox::Yes)
+                return;
+
+            centralWidget()->setEnabled(false);
+            startBenchAction->setEnabled(false);
+            stopBenchAction->setEnabled(true);
+
+            m_glWidget->startBenchmark();
+        }
+        );
+
+    connect(
+        stopBenchAction,
+        &QAction::triggered,
+        this,
+        [this]()
+        {
+            m_glWidget->stopBenchmark();
+        }
+        );
+
+    // Вызывается и при нормальном завершении, и при остановке.
+    m_glWidget->onBenchmarkFinished =
+        [this, startBenchAction, stopBenchAction](
+            bool completed,
+            const std::string& csv)
+    {
+        centralWidget()->setEnabled(true);
+        startBenchAction->setEnabled(true);
+        stopBenchAction->setEnabled(false);
+
+        if (!completed)
+            return;
+
+        const QString path = QFileDialog::getSaveFileName(
+            this,
+            "Сохранить результаты бенчмарка",
+            "benchmark.csv",
+            "CSV (*.csv)"
+            );
+
+        if (path.isEmpty())
+            return;
+
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        {
+            QMessageBox::warning(
+                this,
+                "Бенчмарк",
+                "Не удалось записать файл:\n" + path
+                );
+            return;
+        }
+
+        file.write(csv.data(), static_cast<qint64>(csv.size()));
+        file.close();
+
+        QMessageBox::information(
+            this,
+            "Бенчмарк",
+            "Результаты сохранены:\n" + path
+            );
+    };
 
     QMenu* helpMenu =
         menuBar()->addMenu("Справка");
@@ -306,6 +499,10 @@ void MainWindow::createMenus()
                 "активных частиц.\n\n"
                 "Ветер — направление действия "
                 "ветрового потока.\n\n"
+                "Коллизии — алгоритм поиска "
+                "поверхности под частицей.\n\n"
+                "Объектов — число статических "
+                "объектов на сцене.\n\n"
                 "FPS — текущая частота обновления "
                 "сцены.\n\n"
                 "Для выполнения требования ТЗ "

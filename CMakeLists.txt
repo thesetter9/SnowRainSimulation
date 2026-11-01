@@ -32,7 +32,10 @@ set(PROJECT_SOURCES
 
 add_executable(SnowRainSimulation ${PROJECT_SOURCES}
     scenedata.h
-    surfacecover.h surfacecover.cpp)
+    surfacecover.h surfacecover.cpp
+    collision.h collision.cpp
+    benchmark.h benchmark.cpp
+    materials.h)
 
 target_link_libraries(SnowRainSimulation PRIVATE
     Qt${QT_VERSION_MAJOR}::Widgets

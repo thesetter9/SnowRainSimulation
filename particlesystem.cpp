@@ -9,6 +9,7 @@
 
 namespace
 {
+
 constexpr std::size_t kMaxSplashes = 8000;
 
 // Сколько снега добавляет одна снежинка в ячейку покрытия.
@@ -25,6 +26,17 @@ float randomFloat(float minValue, float maxValue)
 
     return minValue + r * (maxValue - minValue);
 }
+
+// Карта материалов под сетку покрытия для заданного набора объектов.
+std::vector<unsigned char> materialMapFor(const BoxList& boxes)
+{
+    return buildMaterialMap(
+        boxes,
+        SurfaceCover::kSize,
+        SurfaceCover::kHalfExtent
+        );
+}
+
 }
 
 ParticleSystem::ParticleSystem(std::size_t maxParticles)
@@ -42,6 +54,10 @@ ParticleSystem::ParticleSystem(std::size_t maxParticles)
 
     for (Particle& s : m_splashes)
         s.life = 0.0f;
+
+    m_boxes = defaultSceneBoxes();
+    m_collision = makeCollision(m_algorithm, m_boxes);
+    m_cover.setMaterialMap(materialMapFor(m_boxes));
 
     init();
 }
@@ -102,9 +118,8 @@ void ParticleSystem::resetParticle(Particle& particle)
 
 float ParticleSystem::surfaceHeight(float x, float z) const
 {
-    // Рельеф и объекты берутся из общего описания сцены,
-    // поэтому физика всегда совпадает с тем, что нарисовано.
-    return sceneHeight(x, z);
+    // Поиск поверхности делегируется выбранному алгоритму коллизий.
+    return m_collision->heightAt(x, z);
 }
 
 void ParticleSystem::spawnSplash(const glm::vec3& position)
@@ -175,7 +190,7 @@ void ParticleSystem::update(float deltaTime)
     // Эта форма одновременно описывает гравитацию и сопротивление
     // среды: без ветра частица падает строго вниз с предельной скоростью.
     const float k =
-        rain ? 1.5f : 4.0f;            // 1/с: как быстро частица «подстраивается»
+        rain ? 1.5f : 4.0f; // 1/с: как быстро частица «подстраивается»
 
     // Доля скорости ветра, которую набирает частица
     // (эмпирический коэффициент увлечения).
@@ -230,14 +245,23 @@ void ParticleSystem::update(float deltaTime)
             if (rain)
             {
                 // Поверхность намокает, у сильного удара — брызги.
+                // Материал решает, будут ли они: по траве капли почти
+                // не отскакивают, по асфальту и камню брызги заметнее.
                 m_cover.addRain(hit.x, hit.z);
 
                 if (-p.velocity.y > kSplashSpeed)
-                    spawnSplash(hit);
+                {
+                    const Material material =
+                        m_cover.materialAt(hit.x, hit.z);
+
+                    if (randomFloat(0.0f, 1.0f) < materialProps(material).splash)
+                        spawnSplash(hit);
+                }
             }
             else
             {
-                // Снежинка остаётся на поверхности и утолщает слой.
+                // Снежинка остаётся на поверхности и утолщает слой
+                // (сколько удержится, зависит от материала).
                 m_cover.addSnow(hit.x, hit.z, kSnowPerFlake);
             }
 
@@ -266,6 +290,7 @@ void ParticleSystem::setType(ParticleType type)
         return;
 
     m_type = type;
+
     init();
 }
 
@@ -336,4 +361,37 @@ const SurfaceCover& ParticleSystem::cover() const
 void ParticleSystem::resetCover()
 {
     m_cover.clear();
+}
+
+// ---------------------------------------------------------------------
+// Коллизии и состав сцены
+// ---------------------------------------------------------------------
+
+void ParticleSystem::setCollisionAlgorithm(CollisionAlgorithm algorithm)
+{
+    m_algorithm = algorithm;
+    m_collision = makeCollision(m_algorithm, m_boxes);
+}
+
+CollisionAlgorithm ParticleSystem::collisionAlgorithm() const
+{
+    return m_algorithm;
+}
+
+// count <= 0 — базовая сцена, иначе случайная сцена из count объектов.
+void ParticleSystem::setObjectCount(int count)
+{
+    m_boxes = (count <= 0)
+    ? defaultSceneBoxes()
+    : makeRandomBoxes(count);
+
+    m_collision = makeCollision(m_algorithm, m_boxes);
+
+    // Новая карта материалов; покрытие при этом сбрасывается.
+    m_cover.setMaterialMap(materialMapFor(m_boxes));
+}
+
+const BoxList& ParticleSystem::boxes() const
+{
+    return m_boxes;
 }
