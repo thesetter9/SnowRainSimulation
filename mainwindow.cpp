@@ -11,6 +11,7 @@
 #include <QMainWindow>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QPushButton>
 #include <QSlider>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -198,6 +199,28 @@ void MainWindow::createInterface()
 
     controlsLayout->addWidget(
         objectsCombo
+        );
+
+    // Сброс снега и влаги со всех поверхностей.
+    QPushButton* resetCoverButton =
+        new QPushButton("Сбросить покрытие");
+
+    resetCoverButton->setToolTip(
+        "Убрать снег и влагу со всех поверхностей"
+        );
+
+    controlsLayout->addWidget(
+        resetCoverButton
+        );
+
+    connect(
+        resetCoverButton,
+        &QPushButton::clicked,
+        this,
+        [this]()
+        {
+            m_glWidget->resetCover();
+        }
         );
 
     m_fpsLabel =
@@ -503,6 +526,8 @@ void MainWindow::createMenus()
                 "поверхности под частицей.\n\n"
                 "Объектов — число статических "
                 "объектов на сцене.\n\n"
+                "Сбросить покрытие — убрать снег и "
+                "влагу со всех поверхностей.\n\n"
                 "FPS — текущая частота обновления "
                 "сцены.\n\n"
                 "Для выполнения требования ТЗ "

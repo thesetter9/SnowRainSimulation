@@ -69,6 +69,9 @@ private:
     BoxList m_boxes;
     std::unique_ptr<ICollision> m_collision;
     CollisionAlgorithm m_algorithm = CollisionAlgorithm::BruteForce;
+    float m_precipHalfX = 14.0f;
+    float m_precipHalfZ = 12.0f;
+    float m_meanSurfaceHeight = 0.0f;
 };
 
 #endif // PARTICLESYSTEM_H

@@ -48,6 +48,13 @@ public:
     int benchmarkTotal() const;
     // completed = false, если остановили вручную
     std::function<void(bool completed, const std::string& csv)> onBenchmarkFinished;
+    void initializeRain();
+    QOpenGLShaderProgram* m_rainShader = nullptr;
+    QOpenGLVertexArrayObject m_rainVao;
+    QOpenGLBuffer m_rainQuadVbo{QOpenGLBuffer::VertexBuffer};
+    QOpenGLBuffer m_rainInstanceVbo{QOpenGLBuffer::VertexBuffer};
+    std::vector<float> m_rainInstances;
+    int m_rainCount = 0;
 
 
 protected:

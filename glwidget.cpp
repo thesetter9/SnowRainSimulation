@@ -1,6 +1,8 @@
 #include "glwidget.h"
 
 #include <QDebug>
+#include <QOpenGLContext>
+#include <QOpenGLExtraFunctions>
 #include <QMatrix4x4>
 #include <QVector3D>
 
@@ -24,6 +26,10 @@ double msSince(const BenchClock::time_point& t0)
 {
     return std::chrono::duration<double, std::milli>(BenchClock::now() - t0).count();
 }
+
+// Штрих дождя: длина следа за каплей и физическая ширина, м.
+constexpr float kRainStreakLength = 0.45f;
+constexpr float kRainDropWidth = 0.012f;
 
 // Направление НА источник света (пасмурное небо сверху-сбоку).
 const QVector3D kLightDir = QVector3D(0.45f, 0.80f, 0.35f).normalized();
@@ -205,10 +211,14 @@ GLWidget::~GLWidget()
     makeCurrent();
 
     delete m_shader;
+    delete m_rainShader;
 
     if (m_coverTexture != 0)
         glDeleteTextures(1, &m_coverTexture);
 
+    m_rainInstanceVbo.destroy();
+    m_rainQuadVbo.destroy();
+    m_rainVao.destroy();
     m_particleVbo.destroy();
     m_particleVao.destroy();
     m_splashVbo.destroy();
@@ -554,6 +564,168 @@ void GLWidget::initializeShaders()
         qDebug() << "Shader link error:"
                  << m_shader->log();
     }
+
+    initializeRain();
+}
+
+// Дождь рисуется отдельным шейдером: каждая капля - один экземпляр
+// квада-штриха, который вершинный шейдер разворачивает к камере.
+void GLWidget::initializeRain()
+{
+    // Только ASCII, в том числе в комментариях (требование драйверов AMD).
+    const char* rainVertexShader = R"(
+        #version 330 core
+
+        // Quad corner: x - side (-1 or +1), y - position along the
+        // streak (0 - head of the drop, 1 - end of its tail).
+        layout(location = 0) in vec2 corner;
+
+        // Per instance: head and tail of the drop in world space.
+        layout(location = 1) in vec3 headPos;
+        layout(location = 2) in vec3 tailPos;
+
+        uniform mat4 view;
+        uniform mat4 projection;
+        uniform vec3 cameraPos;
+        uniform float dropWidth;   // physical width, meters
+        uniform float pixelScale;  // world size of one pixel at distance 1 m
+
+        out float vSide;
+        out float vT;
+        out float vCoverage;
+        out float vViewDist;
+
+        void main()
+        {
+            vec3 center = mix(headPos, tailPos, corner.y);
+            vec3 axis = headPos - tailPos;
+            vec3 toCamera = cameraPos - center;
+
+            // Widen the streak perpendicular to both its axis and the view
+            // direction, so it always faces the camera.
+            vec3 side = cross(axis, toCamera);
+            float sideLength = length(side);
+            side = (sideLength > 1e-5) ? side / sideLength : vec3(1.0, 0.0, 0.0);
+
+            // Never thinner than about 1.5 pixels: thin distant streaks
+            // would flicker. The lost coverage is compensated by alpha.
+            float dist = length(toCamera);
+            float width = max(dropWidth, 1.5 * pixelScale * dist);
+
+            vec3 worldPos = center + side * (corner.x * 0.5 * width);
+            vec4 viewPos = view * vec4(worldPos, 1.0);
+
+            gl_Position = projection * viewPos;
+
+            vSide = corner.x;
+            vT = corner.y;
+            vCoverage = dropWidth / width;
+            vViewDist = length(viewPos.xyz);
+        }
+    )";
+
+    const char* rainFragmentShader = R"(
+        #version 330 core
+
+        in float vSide;
+        in float vT;
+        in float vCoverage;
+        in float vViewDist;
+
+        uniform vec3 fogColor;
+
+        out vec4 fragColor;
+
+        void main()
+        {
+            vec3 headColor = vec3(0.75, 0.85, 1.0);
+            vec3 tailColor = vec3(0.40, 0.55, 0.80);
+            vec3 color = mix(headColor, tailColor, vT);
+
+            // Soft edges across the streak, fading tail, and reduced alpha
+            // for streaks that were widened to the minimum pixel width.
+            float edge = 1.0 - smoothstep(0.35, 1.0, abs(vSide));
+            float alpha = mix(0.65, 0.10, vT) * edge
+                        * clamp(vCoverage * 1.5, 0.25, 1.0);
+
+            // Fog: far drops fade into the sky color.
+            float fog = 1.0 - exp(-vViewDist * vViewDist * 0.0007);
+            color = mix(color, fogColor, clamp(fog, 0.0, 1.0));
+
+            fragColor = vec4(color, alpha);
+        }
+    )";
+
+    m_rainShader = new QOpenGLShaderProgram(this);
+
+    if (!m_rainShader->addShaderFromSourceCode(
+            QOpenGLShader::Vertex,
+            rainVertexShader))
+    {
+        qDebug() << "Rain vertex shader error:"
+                 << m_rainShader->log();
+    }
+
+    if (!m_rainShader->addShaderFromSourceCode(
+            QOpenGLShader::Fragment,
+            rainFragmentShader))
+    {
+        qDebug() << "Rain fragment shader error:"
+                 << m_rainShader->log();
+    }
+
+    if (!m_rainShader->link())
+    {
+        qDebug() << "Rain shader link error:"
+                 << m_rainShader->log();
+    }
+
+    // Четыре угла квада для GL_TRIANGLE_STRIP.
+    static const float kCorners[8] =
+        {
+            -1.0f, 0.0f,
+            1.0f, 0.0f,
+            -1.0f, 1.0f,
+            1.0f, 1.0f
+        };
+
+    QOpenGLExtraFunctions* gl = context()->extraFunctions();
+
+    m_rainVao.create();
+    m_rainVao.bind();
+
+    m_rainQuadVbo.create();
+    m_rainQuadVbo.bind();
+    m_rainQuadVbo.allocate(kCorners, static_cast<int>(sizeof(kCorners)));
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(
+        0, 2, GL_FLOAT, GL_FALSE,
+        2 * sizeof(float),
+        nullptr
+        );
+
+    // Данные экземпляров заполняются каждый кадр в uploadParticles().
+    m_rainInstanceVbo.create();
+    m_rainInstanceVbo.bind();
+
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(
+        1, 3, GL_FLOAT, GL_FALSE,
+        6 * sizeof(float),
+        nullptr
+        );
+    gl->glVertexAttribDivisor(1, 1);
+
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(
+        2, 3, GL_FLOAT, GL_FALSE,
+        6 * sizeof(float),
+        reinterpret_cast<void*>(3 * sizeof(float))
+        );
+    gl->glVertexAttribDivisor(2, 1);
+
+    m_rainVao.release();
 }
 
 // Строит геометрию сцены (рельеф + объекты) и загружает её в GPU.
@@ -714,52 +886,54 @@ void GLWidget::uploadParticles()
     const std::size_t count =
         m_particleSystem.getActiveCount();
 
-    m_particleVertices.clear();
-
     const bool rain =
         m_particleSystem.getType() == ParticleType::RAIN;
 
     if (rain)
     {
-        m_particleVertices.reserve(count * 2 * 6);
+        // Для каждой капли: голова и конец хвоста (6 float).
+        // Сам штрих строится в вершинном шейдере.
+        m_rainInstances.clear();
+        m_rainInstances.reserve(count * 6);
 
         for (std::size_t i = 0; i < count; ++i)
         {
             const Particle& p = particles[i];
 
-            const glm::vec3 direction =
-                glm::normalize(p.velocity);
-
             const glm::vec3 tail =
-                p.position - direction * 0.45f;
+                p.position - glm::normalize(p.velocity) * kRainStreakLength;
 
-            // Голова капли (ярче).
-            pushVertex(
-                m_particleVertices,
-                p.position,
-                glm::vec3(0.75f, 0.85f, 1.0f)
-                );
-
-            // Хвост (темнее).
-            pushVertex(
-                m_particleVertices,
-                tail,
-                glm::vec3(0.40f, 0.55f, 0.80f)
-                );
+            m_rainInstances.push_back(p.position.x);
+            m_rainInstances.push_back(p.position.y);
+            m_rainInstances.push_back(p.position.z);
+            m_rainInstances.push_back(tail.x);
+            m_rainInstances.push_back(tail.y);
+            m_rainInstances.push_back(tail.z);
         }
+
+        m_rainCount = static_cast<int>(count);
+
+        m_rainInstanceVbo.bind();
+        m_rainInstanceVbo.allocate(
+            m_rainInstances.data(),
+            static_cast<int>(m_rainInstances.size() * sizeof(float))
+            );
+        m_rainInstanceVbo.release();
+
+        return;
     }
-    else
-    {
-        m_particleVertices.reserve(count * 6);
 
-        for (std::size_t i = 0; i < count; ++i)
-        {
-            pushVertex(
-                m_particleVertices,
-                particles[i].position,
-                glm::vec3(0.95f, 0.98f, 1.0f)
-                );
-        }
+    // Снег: точки-спрайты.
+    m_particleVertices.clear();
+    m_particleVertices.reserve(count * 6);
+
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        pushVertex(
+            m_particleVertices,
+            particles[i].position,
+            glm::vec3(0.95f, 0.98f, 1.0f)
+            );
     }
 
     uploadVertices(m_particleVao, m_particleVbo, m_particleVertices);
@@ -940,53 +1114,78 @@ void GLWidget::drawParticles(
     const QVector3D fog =
         fogColorFor(type);
 
-    m_shader->bind();
-
-    setSceneUniforms(
-        m_shader,
-        view,
-        projection,
-        rain ? 2 : 1,
-        fog,
-        m_cameraPosition,
-        lightScaleFor(type)
-        );
-
-    m_shader->setUniformValue("pointScale", 90.0f);
-
     // Частицы не пишут в буфер глубины: полупрозрачные частицы
     // не закрывают друг друга, но корректно скрываются за поверхностью.
     glDepthMask(GL_FALSE);
 
-    m_particleVao.bind();
-
-    const int count =
-        static_cast<int>(m_particleSystem.getActiveCount());
-
     if (rain)
     {
-        glLineWidth(1.5f);
+        // Дождь: штрихи-квады, по одному экземпляру на каплю.
+        QOpenGLExtraFunctions* gl = context()->extraFunctions();
 
-        glDrawArrays(
-            GL_LINES,
-            0,
-            count * 2
+        m_rainShader->bind();
+
+        m_rainShader->setUniformValue("view", glmToQt(view));
+        m_rainShader->setUniformValue("projection", glmToQt(projection));
+        m_rainShader->setUniformValue(
+            "cameraPos",
+            QVector3D(
+                m_cameraPosition.x,
+                m_cameraPosition.y,
+                m_cameraPosition.z
+                )
             );
+        m_rainShader->setUniformValue("dropWidth", kRainDropWidth);
+
+        // Размер одного пикселя на расстоянии 1 м при угле обзора 45 градусов.
+        m_rainShader->setUniformValue(
+            "pixelScale",
+            2.0f * std::tan(glm::radians(45.0f) * 0.5f) /
+                static_cast<float>(m_height)
+            );
+        m_rainShader->setUniformValue("fogColor", fog);
+
+        m_rainVao.bind();
+        gl->glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, m_rainCount);
+        m_rainVao.release();
+
+        m_rainShader->release();
     }
     else
     {
+        // Снег: круглые точки-спрайты.
+        m_shader->bind();
+
+        setSceneUniforms(
+            m_shader,
+            view,
+            projection,
+            1,
+            fog,
+            m_cameraPosition,
+            lightScaleFor(type)
+            );
+
+        m_shader->setUniformValue("pointScale", 90.0f);
+
+        m_particleVao.bind();
+
         glDrawArrays(
             GL_POINTS,
             0,
-            count
+            static_cast<int>(m_particleSystem.getActiveCount())
             );
-    }
 
-    m_particleVao.release();
+        m_particleVao.release();
+
+        m_shader->release();
+    }
 
     // Брызги: мелкие точки, рисуются как спрайты.
     if (!m_splashVertices.empty())
     {
+        m_shader->bind();
+
         setSceneUniforms(
             m_shader,
             view,
@@ -1008,11 +1207,11 @@ void GLWidget::drawParticles(
             );
 
         m_splashVao.release();
+
+        m_shader->release();
     }
 
     glDepthMask(GL_TRUE);
-
-    m_shader->release();
 }
 
 void GLWidget::mousePressEvent(QMouseEvent* event)

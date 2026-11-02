@@ -27,6 +27,58 @@ float randomFloat(float minValue, float maxValue)
     return minValue + r * (maxValue - minValue);
 }
 
+// ---- Модель падения частицы в воздухе (общая для update() и спавна) ----
+//
+// Частица стремится к скорости воздуха: a = k * (v_target - v), где
+// v_target = ветер * windResponse + (0, -terminal, 0).
+
+// Предельная скорость падения: у снежинок зависит от размера.
+float terminalSpeed(bool rain, float size)
+{
+    return rain ? 9.0f : (0.8f + size * 6.0f);
+}
+
+// 1/с: как быстро частица «подстраивается» под воздух.
+float relaxRate(bool rain)
+{
+    return rain ? 1.5f : 4.0f;
+}
+
+// Доля скорости ветра, которую набирает частица
+// (эмпирический коэффициент увлечения).
+float windResponse(bool rain)
+{
+    return rain ? 1.2f : 0.35f;
+}
+
+// На сколько метров ветер сносит частицу по горизонтали, пока она
+// падает с высоты height. Разгон от нулевой горизонтальной скорости
+// до u = ветер * windResponse с постоянной времени 1/k даёт
+//     drift = u * (T - (1 - exp(-k*T)) / k),   T = height / terminal.
+float windDrift(bool rain, float size, float height, float windSpeed)
+{
+    const float k = relaxRate(rain);
+    const float fallTime = height / terminalSpeed(rain, size);
+    const float u = windSpeed * windResponse(rain);
+
+    return u * (fallTime - (1.0f - std::exp(-k * fallTime)) / k);
+}
+
+// Высота падения до средней поверхности: частицы, садящиеся на высокие
+// объекты, летят короче, а значит ветер сносит их меньше.
+float fallHeight(float startHeight, float meanSurface)
+{
+    return std::max(startHeight - meanSurface, 0.5f);
+}
+
+// Минимальная область, над которой выпадают осадки (центр в начале
+// координат). Для больших сцен она расширяется (см. setObjectCount).
+constexpr float kRainHalfX = 14.0f;
+constexpr float kRainHalfZ = 12.0f;
+
+// Зазор между краем крайнего объекта и краем области осадков, м.
+constexpr float kRainMargin = 2.0f;
+
 // Карта материалов под сетку покрытия для заданного набора объектов.
 std::vector<unsigned char> materialMapFor(const BoxList& boxes)
 {
@@ -55,6 +107,10 @@ ParticleSystem::ParticleSystem(std::size_t maxParticles)
     for (Particle& s : m_splashes)
         s.life = 0.0f;
 
+    m_precipHalfX = kRainHalfX;
+    m_precipHalfZ = kRainHalfZ;
+    m_meanSurfaceHeight = 0.0f;
+
     m_boxes = defaultSceneBoxes();
     m_collision = makeCollision(m_algorithm, m_boxes);
     m_cover.setMaterialMap(materialMapFor(m_boxes));
@@ -64,31 +120,43 @@ ParticleSystem::ParticleSystem(std::size_t maxParticles)
 
 void ParticleSystem::init()
 {
+    const bool rain = (m_type == ParticleType::RAIN);
+
     for (Particle& particle : m_particles)
     {
         resetParticle(particle);
 
         // Разбрасываем частицы по высоте,
         // чтобы экран сразу был заполнен осадками.
-        particle.position.y =
-            randomFloat(3.0f, 18.0f);
+        // Точка приземления при этом сохраняется: меняем высоту и
+        // пересчитываем смещение против ветра.
+        const float oldHeight = particle.position.y;
+        const float newHeight = randomFloat(3.0f, 18.0f);
+
+        const float shift =
+            windDrift(rain, particle.size,
+                      fallHeight(oldHeight, m_meanSurfaceHeight), m_windStrength) -
+            windDrift(rain, particle.size,
+                      fallHeight(newHeight, m_meanSurfaceHeight), m_windStrength);
+
+        particle.position.x += m_windDirection.x * shift;
+        particle.position.z += m_windDirection.z * shift;
+        particle.position.y = newHeight;
     }
 }
 
 void ParticleSystem::resetParticle(Particle& particle)
 {
-    const float x = randomFloat(-14.0f, 14.0f);
-    const float z = randomFloat(-12.0f, 12.0f);
+    const bool rain = (m_type == ParticleType::RAIN);
 
-    particle.position = glm::vec3(
-        x,
-        randomFloat(13.0f, 20.0f),
-        z
-        );
+    // Куда частица должна упасть: равномерно по области осадков.
+    const float landX = randomFloat(-m_precipHalfX, m_precipHalfX);
+    const float landZ = randomFloat(-m_precipHalfZ, m_precipHalfZ);
+    const float height = randomFloat(13.0f, 20.0f);
 
     particle.life = 1.0f;
 
-    if (m_type == ParticleType::RAIN)
+    if (rain)
     {
         particle.velocity = glm::vec3(
             randomFloat(-0.3f, 0.3f),
@@ -114,6 +182,19 @@ void ParticleSystem::resetParticle(Particle& particle)
 
         particle.size = randomFloat(0.08f, 0.16f);
     }
+
+    // Пока частица падает, ветер сносит её. Чтобы осадки ложились на
+    // всю область, а не только на её подветренную часть, стартуем
+    // с запасом против ветра на величину ожидаемого сноса.
+    const float drift =
+        windDrift(rain, particle.size,
+                  fallHeight(height, m_meanSurfaceHeight), m_windStrength);
+
+    particle.position = glm::vec3(
+        landX - m_windDirection.x * drift,
+        height,
+        landZ - m_windDirection.z * drift
+        );
 }
 
 float ParticleSystem::surfaceHeight(float x, float z) const
@@ -189,24 +270,29 @@ void ParticleSystem::update(float deltaTime)
     //     a = k * (v_target - v)
     // Эта форма одновременно описывает гравитацию и сопротивление
     // среды: без ветра частица падает строго вниз с предельной скоростью.
-    const float k =
-        rain ? 1.5f : 4.0f; // 1/с: как быстро частица «подстраивается»
+    const float k = relaxRate(rain);
+    const float response = windResponse(rain);
 
-    // Доля скорости ветра, которую набирает частица
-    // (эмпирический коэффициент увлечения).
-    const float windResponse =
-        rain ? 1.2f : 0.35f;
+    // Границы «живой» области: сцена плюс запас на снос ветром (с учётом
+    // порывов и самых лёгких частиц). За ними частица пересоздаётся.
+    // Запас нужен, чтобы частицы, стартующие против ветра, не удалялись
+    // сразу после появления.
+    const float driftMargin =
+        std::min(
+            windDrift(rain, rain ? 0.07f : 0.08f, 20.0f, m_windStrength * 1.6f),
+            25.0f
+            );
+    const float liveLimit = 22.0f + driftMargin;
 
     for (std::size_t i = 0; i < m_activeCount; ++i)
     {
         Particle& p = m_particles[i];
 
-        // Предельная скорость падения: у снежинок зависит от размера.
         const float terminal =
-            rain ? 9.0f : (0.8f + p.size * 6.0f);
+            terminalSpeed(rain, p.size);
 
         glm::vec3 target =
-            wind * windResponse +
+            wind * response +
             glm::vec3(0.0f, -terminal, 0.0f);
 
         if (!rain)
@@ -271,8 +357,8 @@ void ParticleSystem::update(float deltaTime)
 
         // Если частица улетела за пределы сцены.
         if (p.position.y < -2.0f ||
-            std::abs(p.position.x) > 16.0f ||
-            std::abs(p.position.z) > 14.0f ||
+            std::abs(p.position.x) > liveLimit ||
+            std::abs(p.position.z) > liveLimit ||
             p.life <= 0.0f)
         {
             resetParticle(p);
@@ -389,6 +475,47 @@ void ParticleSystem::setObjectCount(int count)
 
     // Новая карта материалов; покрытие при этом сбрасывается.
     m_cover.setMaterialMap(materialMapFor(m_boxes));
+
+    // Область осадков должна накрывать всю сцену: иначе внешние объекты
+    // большой сцены останутся сухими. Для базовой сцены область прежняя.
+    float maxX = 0.0f;
+    float maxZ = 0.0f;
+
+    for (const SceneBox& b : m_boxes)
+    {
+        maxX = std::max({ maxX, std::abs(b.x0), std::abs(b.x1) });
+        maxZ = std::max({ maxZ, std::abs(b.z0), std::abs(b.z1) });
+    }
+
+    const float limit = SurfaceCover::kHalfExtent - kRainMargin;
+
+    m_precipHalfX = std::min(limit, std::max(kRainHalfX, maxX + kRainMargin));
+    m_precipHalfZ = std::min(limit, std::max(kRainHalfZ, maxZ + kRainMargin));
+
+    // Средняя высота поверхности над областью осадков (выборка по сетке):
+    // нужна, чтобы корректно оценивать снос ветром при падении.
+    const int samples = 24;
+    float sum = 0.0f;
+
+    for (int iz = 0; iz < samples; ++iz)
+    {
+        for (int ix = 0; ix < samples; ++ix)
+        {
+            const float x =
+                -m_precipHalfX + (static_cast<float>(ix) + 0.5f) *
+                                     2.0f * m_precipHalfX / static_cast<float>(samples);
+            const float z =
+                -m_precipHalfZ + (static_cast<float>(iz) + 0.5f) *
+                                     2.0f * m_precipHalfZ / static_cast<float>(samples);
+
+            sum += surfaceHeight(x, z);
+        }
+    }
+
+    m_meanSurfaceHeight = sum / static_cast<float>(samples * samples);
+
+    // Перераспределяем частицы по новой области.
+    init();
 }
 
 const BoxList& ParticleSystem::boxes() const
